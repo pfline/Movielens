@@ -1,0 +1,531 @@
+---
+title: "Movielens Capstone Project"
+author: "Pierre FLINE"
+date: "27/01/2022"
+output: 
+  pdf_document: 
+    toc: yes
+    toc_depth: 1
+    number_sections: yes
+---
+
+```{r setup, include=FALSE}
+if(!require(knitr)) install.packages("knitr", repos = "http://cran.us.r-project.org")
+library(knitr)
+
+knitr::opts_chunk$set(echo = FALSE, message=FALSE, warning=FALSE)
+
+options(digits = 5)
+```
+
+```{r installation-load-packages}
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+if(!require(tinytex)) install.packages("tinytex", repos = "http://cran.us.r-project.org")
+if(!require(recosystem)) install.packages("recosystem", repos = "http://cran.us.r-project.org")
+
+library(tidyverse)
+library(caret)
+library(data.table)
+library(tinytex)
+library(recosystem)
+
+tinytex::install_tinytex()
+```
+# Introduction
+
+This report is produced as one of the final reports to complete the *Data Science Professional Certificate*, an online program provided by [Harvard University](https://pll.harvard.edu/series/professional-certificate-data-science) through [edx](https://www.edx.org/) platform.
+
+The assignment is to predict the rating of a set of movies by a set of users with the best possible accuracy. The accuracy is here measured as the Residual Mean Squared Error (RMSE), which we can calculate this way:
+
+$$
+RMSE = \sqrt{{\frac{1}{N}\sum_{}^{N}{(y - y')^2}}}
+$$
+where:  
+`y`: real rating (outcome)  
+`y'`: predicted rating (prediction)  
+N: number of ratings
+
+Two data frames are provided:  
+- an **edx set**: a set of known data for which we can consider that we know the outcomes and the features, and on which we a required to build a prediction algorithm.  
+- a **validation set**: a set of data on which we should predict the outcome, given the features. The RMSE on this set should be as low as possible.   
+
+The goal is to get a RMSE<0.86490.  
+
+# Data creation
+The original data set is downloaded from the website of the [GroupLens research lab](http://files.grouplens.org/datasets/movielens/ml-10m.zip).  
+It is randomly split between :  
+- an **edx set** (90% of the observations), which will be used to create our prediction model  
+- a **validation set** (10% of the observations), which will be used only to assess the performance of our prediction model  
+
+```{r data-creation}
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                 col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(movieId),
+                                            title = as.character(title),
+                                            genres = as.character(genres))
+
+
+movielens <- left_join(ratings, movies, by = "movieId")
+
+# Validation set will be 10% of MovieLens data
+set.seed(1, sample.kind="Rounding")
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+# Make sure userId and movieId in validation set are also in edx set
+validation <- temp %>% 
+      semi_join(edx, by = "movieId") %>%
+      semi_join(edx, by = "userId")
+
+# Add rows removed from validation set back into edx set
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+```
+
+We make sure that the validation set does not include any user or movie that do not appear in the edx set.  
+
+The edx set is randomly split into two sets:  
+- a train set: **train_set** (50% of the observations)  
+- a test set: **test_set** (50% of the observations)  
+
+```{r split-edx-set}
+test_index <- createDataPartition(edx$rating, times = 1, p = 0.5, list = FALSE)
+test_set <- edx[test_index, ]
+train_set <- edx[-test_index, ]
+```
+
+We make sure that the test_set does not include any user or movie that do not appear in the train_set.  
+```{r semijoin-test-set}
+test_set <- test_set %>%
+  semi_join(train_set, by = "movieId") %>%
+  semi_join(train_set, by = "userId")
+```
+
+
+# Data exploration : edx data frame
+
+Let's explore the structure of the **edx set**.  
+
+Classes of the variables:  
+```{r edx-classes}
+sapply(edx, class)
+```
+
+First values of the variables:  
+```{r edx-head}
+head(edx)
+```
+
+Number of unique users (userId):  
+```{r nb-unique-users}
+length(unique(edx$userId))
+```
+
+Number of unique movies (movieId):  
+```{r nb-unique-movies}
+length(unique(edx$movieId))
+```
+
+Timestamp distribution key values:  
+```{r summary-timestamp}
+summary(edx$timestamp)
+```
+
+Number of unique titles:  
+```{r nb-unique-titles}
+length(unique(edx$title))
+```
+
+Number of unique genres (including combinations):  
+```{r nb-unique-genres}
+length(unique(edx$genres))
+```
+Note that the "genres" variable in the edx set is often a combination of various genres. For example there are two observations called "Crime|Drama|Thriller" and "Comedy|Drama", both include "Drama".  
+
+There are no NAs in the edx data frame, for any of the variables.  
+```{r nb-nas, include=FALSE}
+edx %>% filter(is.na(userId))
+edx %>% filter(is.na(movieId))
+edx %>% filter(is.na(rating))
+edx %>% filter(is.na(timestamp))
+edx %>% filter(is.na(title))
+edx %>% filter(is.na(genres))
+```
+
+**Ratings distribution:**  
+```{r plot-ratings-edx-set}
+qplot(rating, data = edx, bins = 10, color = I("black"), ylab="number of ratings")
+```
+Half ratings tend to be less frequent than full ratings.
+  
+**Timestamp distribution:**  
+```{r plot-timestamps-edx-set}
+qplot(timestamp, data = edx, color = I("black"), ylab="number of ratings")
+```
+  
+**Genres distribution:**  
+As there are 797 genres combinations, we filter those with more than 100 000 ratings only.  
+Here is the distribution:  
+```{r plot-genres-edx-set}
+edx %>%
+  group_by(genres) %>%
+  filter(n()>100000) %>%
+  ggplot(aes(genres))+
+  geom_histogram(stat="count")+
+  theme(axis.text.x=element_text(angle=90,hjust=0))+
+  labs(y="number of ratings")
+```
+
+# Modelisation
+
+In this part we will build various models, trained on the **train_set** and tested on the **test_set**.  
+The letter y is used to define the real ratings (outcomes) of a given data set.  
+
+```{r RMSE-function}
+#We create a RMSE function to evaluate de Residual Mean Squared Error.
+RMSE<-function(true_ratings,predicted_ratings){
+  sqrt(mean((true_ratings-predicted_ratings)^2))
+}
+```
+
+## The mean only
+The distribution of the ratings showed a correlation between the ratings and the number of ratings.  
+
+Say $\mu_{}$ is the ratings mean of the **train_set**.  
+Value of  $\mu_{}$:  
+```{r mu-mean}
+mu <- mean(train_set$rating)
+mu
+```
+
+Assume each user will grade each movie as $\mu_{}$.  
+Here is the resulting RMSE on the **test_set**:
+```{r RMSE-mu}
+RMSE1<-RMSE(test_set$rating,mean(train_set$rating))
+Method1<-"The mean only"
+Result1<-cbind(Method1,round(RMSE1,5))
+colnames(Result1)<-c("Method","RMSE")
+knitr::kable(Result1)
+
+```
+
+## The mean + movie effect
+Say b~i~ is the movie effect.  
+b~i~ is the mean of "y-$\mu_{}$" for each movie (movieId).  
+
+Distribution of b~i~:  
+```{r distribution-bi}
+movie_avgs <- train_set %>%
+  group_by(movieId) %>%
+  summarize(b_i = mean(rating-mu))
+
+qplot(b_i, data = movie_avgs, bins = 50, color = I("black"), ylab="number of ratings")
+```
+
+Assume each user will grade each movie as "$\mu_{}$+b~i~".  
+Here is the resulting RMSE on the **test_set**:  
+```{r RMSE-mu+bi}
+predicted_ratings <- mu+test_set %>%
+  left_join(movie_avgs, by='movieId') %>%
+  pull(b_i)
+RMSE2<-RMSE(predicted_ratings, test_set$rating)
+Method2<-"Mean + movie effect"
+Result2<-cbind(Method2,round(RMSE2,5))
+colnames(Result2)<-c("Method","RMSE")
+knitr::kable(Result2)
+```
+
+## The mean + user effect
+Say b~u~ is the user effect.  
+b~u~ is the mean of "y-$\mu_{}$" for each user (userId).  
+
+Distribution of b~u~:  
+```{r distribution-bu}
+userWithoutMovie_avgs <- train_set %>%
+  group_by(userId) %>%
+  summarize(b_uwithouti = mean(rating-mu))
+
+qplot(b_uwithouti, data = userWithoutMovie_avgs, bins = 50, color = I("black"), ylab="number of ratings", xlab="b_u")
+```
+
+Assume each user will grade each movie as "$\mu_{}$+b~u~".  
+Here is the resulting RMSE on the **test_set**:  
+```{r RMSE-mu+bu}
+predicted_ratings <- mu+test_set %>%
+  left_join(userWithoutMovie_avgs, by='userId') %>%
+  pull(b_uwithouti)
+RMSE3<-RMSE(predicted_ratings, test_set$rating)
+Method3<-"Mean + user effect"
+Result3<-cbind(Method3,round(RMSE3,5))
+colnames(Result3)<-c("Method","RMSE")
+knitr::kable(Result3)
+```
+
+## The mean + genre effect
+Say b~g~ is the genre effect.  
+b~g~ is the mean of "y-$\mu_{}$" for each genre (genres).  
+
+Distribution of b~g~:  
+```{r distribution-bg}
+genresWithoutUserNorMovie_avgs <- train_set %>%
+  group_by(genres) %>%
+  summarize(b_gwithoutunori = mean(rating-mu))
+
+qplot(b_gwithoutunori, data = genresWithoutUserNorMovie_avgs, bins = 50, color = I("black"), ylab="number of ratings", xlab="b_g")
+```
+
+Assume each user will grade each movie as "$\mu_{}$+b~g~".  
+Here is the resulting RMSE on the **test_set**:
+```{r RMSE-mu+bg}
+predicted_ratings <- mu+test_set %>%
+  left_join(genresWithoutUserNorMovie_avgs, by='genres') %>%
+  pull(b_gwithoutunori)
+RMSE4<-RMSE(predicted_ratings, test_set$rating)
+Method4<-"Mean + genre effect"
+Result4<-cbind(Method4,round(RMSE4,5))
+colnames(Result4)<-c("Method","RMSE")
+knitr::kable(Result4)
+```
+
+## The mean + movie effect + user effect
+Say b~i~ is the movie effect.  
+b~i~ is the mean of "y-$\mu_{}$" for each movie (movieId). 
+  
+Say b~u~ is the user effect.  
+b~u~ is the mean of "y-$\mu_{}$-b~i~" for each pair of movie/user (movieId/userId).  
+
+Distribution of b~u~:  
+```{r distribution-bu2}
+user_avgs <- train_set %>%
+  left_join(movie_avgs, by='movieId') %>%
+  group_by(userId) %>%
+  summarize(b_u = mean(rating - mu - b_i))
+
+qplot(b_u, data = user_avgs, bins = 50, color = I("black"), ylab="number of ratings")
+```
+
+Assume each user will grade each movie as "$\mu_{}$+b~i~+b~u~".  
+Here is the resulting RMSE on the **test_set**:  
+```{r RMSE-mu+bi+bu2}
+predicted_ratings <- test_set %>%
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  mutate(pred = mu + b_i + b_u) %>%
+  pull(pred)
+RMSE5<-RMSE(predicted_ratings, test_set$rating)
+Method5<-"Mean + movie effect + user effect"
+Result5<-cbind(Method5,round(RMSE5,5))
+colnames(Result5)<-c("Method","RMSE")
+knitr::kable(Result5)
+```
+
+## The mean + movie effect + user effect + genres effect
+Say b~i~ is the movie effect.  
+b~i~ is the mean of "y-$\mu_{}$" for each movie (movieId). 
+  
+Say b~u~ is the user effect.  
+b~u~ is the mean of "y-$\mu_{}$-b~i~" for each pair of movie/user (movieId/userId).  
+  
+Say b~g~ is the genre effect.  
+b~g~ is the mean of "y-$\mu_{}$-b~i~-b~u~" for each trio of movie/user/genre (movieId/userId/genres).  
+
+Distribution of b~g~:  
+```{r distribution-bg2}
+genres_avgs <- train_set %>%
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  group_by(genres) %>%
+  summarize(b_g = mean(rating - mu - b_i - b_u))
+
+qplot(b_g, data = genres_avgs, bins = 50, color = I("black"), ylab="number of ratings")
+```
+
+Assume each user will grade each movie as "$\mu_{}$+b~i~+b~u~+b~g~".  
+Here is the resulting RMSE on the **test_set**:  
+```{r RMSE-mu+bi+bu+bg}
+predicted_ratings <- test_set %>%
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  left_join(genres_avgs, by='genres') %>%
+  mutate(pred = mu + b_i + b_u + b_g) %>%
+  pull(pred)
+RMSE6<-RMSE(predicted_ratings, test_set$rating)
+Method6<-"Mean + movie effect + user effect + genre effect"
+Result6<-cbind(Method6,round(RMSE6,5))
+colnames(Result6)<-c("Method","RMSE")
+knitr::kable(Result6)
+```
+
+## The mean + movie effect + user effect with regularization
+The idea of regularization is to penalize users and/or movies with few ratings, as they are supposed to be less accurate than users and movies with lots of ratings.  
+
+For this we define two parameters, $\lambda_{u}$ and $\lambda_{i}$.  
+
+Say b~i~ is the movie effect.  
+b~i~ is defined for each movie (movieId) as follows:  
+$$
+b_{i} = \sum_{}^{}\frac{y-\mu}{n+\lambda_{i}}  
+$$
+where n is the number of ratings for each movie (movieId).  
+
+Say b~u~ is the user effect.  
+b~u~ is is defined for each pair of movie/user (movieId/userId) as follows:  
+$$
+b_{u} = \sum_{}^{}\frac{y-\mu-b_{i}}{n+\lambda_{u}}
+$$
+where n is the number of ratings for each pair of movie/user (movieId/userId).  
+
+Assume each user will grade each movie as "$\mu_{}$+b~i~+b~u~".  
+We evaluate the RMSE for $\lambda_{u}$ and $\lambda_{i}$ from 1 to 10, with steps of 1.    
+```{r RMSE-regularized-100-lambdas}
+MatrixOfLambdas<-matrix(nrow=100,ncol=3)
+colnames(MatrixOfLambdas)<-c("lambda_u","lambda_i","RMSE")
+n<-0
+for(lambda_u in 1:10){
+  for (lambda_i in 1:10){
+    n<-n+1
+    mu <- mean(train_set$rating)
+    b_i <- train_set %>%
+      group_by(movieId) %>%
+      summarize(b_i = sum(rating - mu)/(n()+lambda_i))
+    b_u <- train_set %>%
+      left_join(b_i, by="movieId") %>%
+      group_by(userId) %>%
+      summarize(b_u = sum(rating - b_i - mu)/(n()+lambda_u))
+    predicted_ratings <-
+      test_set %>%
+      left_join(b_i, by = "movieId") %>%
+      left_join(b_u, by = "userId") %>%
+      mutate(pred = mu + b_i + b_u) %>%
+      pull(pred)
+    MatrixOfLambdas[n,1]<-lambda_u
+    MatrixOfLambdas[n,2]<-lambda_i
+    MatrixOfLambdas[n,3]<-RMSE(predicted_ratings, test_set$rating)
+    }
+}
+```
+Here is the lowest RMSE obtained:  
+```{r RMSE-regularized-lowest}
+DataFrameOfLambdas<-as.data.frame(MatrixOfLambdas)
+RMSE7<-min(DataFrameOfLambdas$RMSE)
+Method7<-"Mean + user effect regularized + movie effect regularized"
+Result7<-cbind(Method7,round(RMSE7,5))
+colnames(Result7)<-c("Method","RMSE")
+knitr::kable(Result7)
+```
+ 
+Plot of the RMSE for the various $\lambda_{u}$ and $\lambda_{i}$    
+```{r RMSE-regularized-plot}
+DataFrameOfLambdas %>%
+  ggplot(aes(x=lambda_u,y=lambda_i, z=RMSE,fill=RMSE))+
+  geom_tile()+
+  #geom_tile(aes(fill=ranges))+
+  scale_fill_gradient(low = "red", high = "yellow")
+```
+
+The lowest RMSE is obtained for the following $\lambda_{u}$ and $\lambda_{i}$ :  
+```{r lambdas-lowest-RMSE}
+lambdamin<-which.min(DataFrameOfLambdas$RMSE)
+knitr::kable(DataFrameOfLambdas[lambdamin,] %>% select(lambda_u,lambda_i), row.names=FALSE)
+```
+
+## The mean + movie effect + user effect + genre effect with regularization
+We perform fairly the same calculation as the previous part.  
+
+We define three parameters, $\lambda_{u}$, $\lambda_{i}$, and $\lambda_{g}$.  
+
+We define b~i~ and b~u~ as in the previous part.  
+
+Say b~g~ is the genre effect.  
+b~g~ is defined for each trio of movie/user/genre (movieId/userId/genres) as follows:  
+$$
+b_{g} = \sum_{}^{}\frac{y-\mu-b_{i}-b_{u}}{n+\lambda_{g}}
+$$
+where n is the number of ratings for each trio of movie/user/genre (movieId/userId/genres).  
+Assume each user will grade each movie as "$\mu_{}$+b~i~+b~u~+b~g~".  
+
+Unfortunately we could not perform this calculation because of a lack of computer resources.  
+
+```{r}
+RMSE8<-NA
+Method8<-"Mean + user effect regularized + movie effect regularized + genre effect regularized"
+Result8<-cbind(Method8,round(RMSE8,5))
+colnames(Result8)<-c("Method","RMSE")
+knitr::kable(Result8)
+```
+
+
+
+## Matrix factorization
+Another way to build our model is to do a matrix factorization, i.e. to factorize the matrix of ratings for each pair of user/movie into two matrices.  
+
+Various packages of matrix factorization are proposed: recosystem, recommenderlab, MatrixExtra, cmfrec...  
+The recosystem is used in this report as it seems to match with our need and as it seems to be fairly simple to use.  
+
+We don't set any parameter in the $tune() function of this package and keep the default ones.  
+```{r recosystem-training}
+data_source_train<- data_memory(user_index = train_set$userId, item_index = train_set$movieId, rating = train_set$rating)
+r<-Reco()
+r$train(data_source_train,opts = list(verbose=FALSE))
+data_source_test<-data_memory(user_index = test_set$userId, item_index = test_set$movieId)
+test_set_predictions<-r$predict(data_source_test,out_memory())
+```
+
+Here is the RMSE obtained:    
+```{r recosystem-RMSE}
+RMSE9<-RMSE(test_set_predictions, test_set$rating)
+Method9<-"Matrix Factorization"
+Result9<-cbind(Method9,round(RMSE9,5))
+colnames(Result9)<-c("Method","RMSE")
+knitr::kable(Result9)
+```
+
+# Results
+Here is a summary of the models we used and the resulting RMSE on the **test_set**:  
+
+```{r results}
+Methods<-c(Method1,Method2,Method3,Method4,Method5,Method6,Method7,Method8,Method9)
+RMSES<-c(RMSE1,RMSE2,RMSE3,RMSE4,RMSE5,RMSE6,RMSE7,RMSE8,RMSE9)
+Results<-cbind(Methods,round(RMSES,5))
+colnames(Results)<-c("Method","RMSE on the test_set")
+knitr::kable(Results)
+```
+
+The best model is the one with matrix factorization.  
+
+We use the matrix factorization model to predict the results on the validation set.  
+```{r matrix_factorization-validation-set-prediction}
+data_source_validation<-data_memory(user_index = validation$userId, item_index = validation$movieId)
+validation_set_predictions<-r$predict(data_source_validation,out_memory())
+```
+
+Here is the resulting RMSE on the **validation set**:  
+```{r matrix_factorization-validation-set-RMSE}
+RMSE_validation<-RMSE(validation_set_predictions, validation$rating)
+Result_validation<-cbind(Method9,round(RMSE_validation,5))
+colnames(Result_validation)<-c("Method","RMSE on the validation set")
+knitr::kable(Result_validation)
+```
+
+# Conclusion
+
+We reached the goal to get a RMSE<0.86490 with a Matrix Factorisation system provided by the recosystem package.
+
+For further improvements, we could:  
+- explore various parameters in the $tune() function  
+- explore other matrix factorization packages such as recommenderlab, MatrixExtra, cmfrec...  
+- consider genres data more in detail  
+- consider timestamp data  
+- consider the fact that half stars are less rated than full stars   
